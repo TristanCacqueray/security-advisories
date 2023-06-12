@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -23,6 +24,7 @@ module Security.Advisories
   )
 where
 
+import qualified Security.OSV as OSV
 import Commonmark.Html (Html, renderHtml)
 import qualified Commonmark.Parser as Commonmark
 import Commonmark.Types
@@ -47,8 +49,9 @@ import Data.Functor ((<&>))
 import Data.Functor.Identity (Identity (Identity))
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map (Map)
+import Data.Either.Extra (maybeToEither)
 import qualified Data.Map as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -71,9 +74,10 @@ parseAdvisory :: Text -> Either ParseAdvisoryError Advisory
 parseAdvisory raw = do
   markdown <- firstPretty MarkdownError (T.pack . show) $ Commonmark.commonmark "input" raw
   (frontMatter, text) <- first MarkdownFormatError $ advisoryDoc markdown
+  !summary <- first MarkdownFormatError $ parseAdvisorySummary text
   table <- firstPretty TomlError TOML.renderTOMLError $ TOML.decode frontMatter
   bimap (mkPretty AdvisoryError (T.pack . show)) ($ T.toStrict $ renderHtml (fromBlock text :: Html ())) $
-    parseAdvisoryTable table
+    parseAdvisoryTable table summary
   where firstPretty
           :: (e -> T.Text -> ParseAdvisoryError)
           -> (e -> T.Text)
@@ -148,7 +152,8 @@ data Advisory = Advisory
     advisoryArchitectures :: Maybe [Architecture],
     advisoryOS :: Maybe [OS],
     advisoryNames :: [(Text, VersionRange)],
-    advisoryHtml :: Text
+    advisoryHtml :: Text,
+    advisorySummary :: Text
   }
   deriving stock (Show)
 
@@ -200,8 +205,8 @@ renderAdvisoryHtml adv =
     row name f = td name <> td (f adv)
     date (Date y m d) = T.intercalate "-" $ T.pack <$> [show y, show m, show d]
 
-parseAdvisoryTable :: TOML.Table -> Either TableParseErr (Text -> Advisory)
-parseAdvisoryTable table = runTableParser $ do
+parseAdvisoryTable :: TOML.Table -> Text -> Either TableParseErr (Text -> Advisory)
+parseAdvisoryTable table advisorySummary = runTableParser $ do
   hasNoKeysBut ["advisory", "affected", "versions"] table
   advisory <- mandatory table "advisory" isTable
 
@@ -256,7 +261,8 @@ parseAdvisoryTable table = runTableParser $ do
         advisoryArchitectures = arch,
         advisoryOS = os,
         advisoryNames = decls,
-        advisoryHtml = html
+        advisoryHtml = html,
+        advisorySummary = advisorySummary
       }
 
 uncurry3 :: (a -> b -> c -> d) -> (a, b, c) -> d
@@ -416,6 +422,33 @@ advisoryDoc (BSeq bseq) =
 advisoryDoc (BRanged _ b) = advisoryDoc b
 advisoryDoc (CodeBlock (T.unpack -> "toml") frontMatter) = pure (frontMatter, mempty)
 advisoryDoc _ = Left "Does not have toml code block as first element"
+
+parseAdvisorySummary :: Block -> Either Text Text
+parseAdvisorySummary = fmap inlineText . firstHeading
+
+firstHeading :: Block -> Either Text Inline
+firstHeading = maybeToEither "Does not have summary heading" . go where
+  go (Heading _ h) = Just h
+  go (AddAttributes _ b) = go b
+  go (BSeq bs) = listToMaybe . mapMaybe go $ bs
+  go (BRanged  _ b) = go b
+  go _ = Nothing
+
+inlineText :: Inline -> Text
+inlineText LineBreak = "\n"
+inlineText SoftBreak = ""
+inlineText (Str s) = s
+inlineText (Entity s) = s
+inlineText (Sequence l) = T.concat $ map inlineText l
+inlineText (Escaped c) = T.singleton c
+inlineText (Emph i) = inlineText i
+inlineText (Strong i) = inlineText i
+inlineText (Link _ _ i) = inlineText i
+inlineText (Image _ _ i) = inlineText i
+inlineText (Code s) = s
+inlineText (RawInline _ s) = s
+inlineText (WithAttrs _ i) = inlineText i
+inlineText (Ranged _ i) = inlineText i
 
 data Block
   = Para Inline
